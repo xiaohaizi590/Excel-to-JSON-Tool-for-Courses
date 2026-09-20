@@ -11,6 +11,17 @@ import org.apache.poi.ss.usermodel.WorkbookFactory
 object ExcelParserTool {
     private const val TAG = "Excel2Json"
 
+    // ---- 周数行推断参数 ----
+    private const val MIN_WEEK = 1              // 学期最小周次
+    private const val MAX_WEEK = 30             // 学期最大周次
+    private const val MAX_WEEK_SPAN = 30        // 单个区间的最大跨度，超过视为异常写法
+    private const val MIN_WEEK_LINE_SCORE = 5   // 判定某行为周数行的最低得分
+    private val WEEK_NUMBER_REGEX = Regex("(\\d+)\\s*[-~～至]\\s*(\\d+)|(\\d+)")
+    private val WEEK_SPEC_REGEX = Regex("^[\\d,，、\\-~～\\s]+$")
+    private val SECTION_BRACKET_REGEX = Regex("[（(\\[【][^）)\\]】]*节[^）)\\]】]*[）)\\]】]")
+    // 地点/班级类关键字：含这些词的行不可能是周数行
+    private val NON_WEEK_KEYWORDS = listOf("楼", "室", "号", "区", "教", "班", "课")
+
     /**
      * 解析二维课表 Excel
      * 逻辑：
@@ -142,13 +153,11 @@ object ExcelParserTool {
     // ======================= 课程块解析 =======================
 
     /**
-     * 解析一个课程块（4-5行文本）
-     * 格式：
-     *   第0行: 课程名
-     *   第1行: 教师名(职称)
-     *   第2行: 周数([周])[节次]
-     *   第3行: 地点
-     *   第4行: 可能还有额外地点（如多个教室）
+     * 解析一个课程块（行数不固定，可能多出"班级"等行）
+     * 常见内容：课程名 / (班级) / 教师(职称) / 周数([周])[节次] / 地点
+     * 周数行位置不固定，以"周"、"节"为锚点定位（相邻两行内匹配），例如：
+     *   1-8([周])[03-04节]
+     *   1-2,4,6,8,12,14,16([周])[01-02节]
      */
     private fun parseCourseBlock(
         lines: List<String>,
@@ -163,17 +172,21 @@ object ExcelParserTool {
         val name = lines.getOrNull(0)?.trim() ?: return null
         if (name.isEmpty()) return null
 
-        // 提取教师（第二行）
-        val teacherLine = lines.getOrNull(1)?.trim() ?: ""
-        val teacher = teacherLine.replace(Regex("\\(.*\\)"), "").trim() // 去掉职称括号
+        // 定位并提取周数行（位置不固定）
+        val weekLineIndex = findWeekLineIndex(lines)
+        val weeks = if (weekLineIndex >= 0) parseWeeksFromLine(lines[weekLineIndex]) else emptyList()
+        if (weeks.isEmpty()) {
+            throw IllegalArgumentException("未识别到周数：请在周数行加入\"周\"字符，例如 1-8([周])[01-02节]")
+        }
 
-        // 提取周数和节次（第三行）
-        val weekLine = lines.getOrNull(2)?.trim() ?: ""
-        val weeks = parseWeeksFromLine(weekLine)
+        // 提取教师（周数行的上一行，找不到周数行时退回第二行）
+        val teacherLine = if (weekLineIndex > 0) lines[weekLineIndex - 1] else lines.getOrNull(1) ?: ""
+        val teacher = teacherLine.replace(Regex("[（(].*[）)]"), "").trim() // 去掉职称/班级括号
 
-        // 提取地点（第四行及以后，可能多个地点）
+        // 提取地点（周数行之后的行，可能多个地点）
         val positions = mutableListOf<String>()
-        for (i in 3 until lines.size) {
+        val startIndex = if (weekLineIndex >= 0) weekLineIndex + 1 else 3
+        for (i in startIndex until lines.size) {
             val line = lines[i].trim()
             if (line.isNotEmpty() && !line.contains("周") && !line.contains("节")) {
                 positions.add(line)
@@ -196,26 +209,97 @@ object ExcelParserTool {
     }
 
     /**
-     * 从 "1-2,4,6,8,12,14,16([周])[01-02节]" 中提取周数列表
+     * 定位周数行：对块内每一行打分，取可信度最高的行
+     * 打分依据：是否含"周"、"节"（锚点）、是否含节次括号、是否"单/双"周、
+     *          去括号后是否只由数字和分隔符组成、周次是否在合理范围且升序、是否紧邻含"节"的行
+     * 返回行索引，最高分达不到阈值则返回 -1
      */
-    private fun parseWeeksFromLine(line: String): List<Int> {
-        // 取 ([周]) 之前的部分，或 [ 之前的部分
-        val weekPart = line.substringBefore("([周])").substringBefore(" [周]").trim()
-        if (weekPart.isEmpty()) return emptyList()
-
-        val result = mutableListOf<Int>()
-        weekPart.split(",").forEach { part ->
-            if (part.contains("-")) {
-                val range = part.split("-").mapNotNull { it.toIntOrNull() }
-                if (range.size == 2) {
-                    result.addAll(range[0]..range[1])
-                }
-            } else {
-                part.toIntOrNull()?.let { result.add(it) }
+    private fun findWeekLineIndex(lines: List<String>): Int {
+        var bestIndex = -1
+        var bestScore = 0
+        for (i in lines.indices) {
+            val score = scoreWeekLine(lines, i)
+            if (score > bestScore) {
+                bestScore = score
+                bestIndex = i
             }
         }
-        return result.distinct().sorted()
+        if (bestIndex >= 0 && bestScore >= MIN_WEEK_LINE_SCORE) {
+            Log.d(TAG, "周数行推断: 第${bestIndex}行 '${lines[bestIndex]}' (得分 $bestScore)")
+            return bestIndex
+        }
+        Log.w(TAG, "未能推断出周数行: $lines")
+        return -1
     }
+
+    /**
+     * 计算某一行作为周数行的可信度得分，0 表示不可能
+     */
+    private fun scoreWeekLine(lines: List<String>, index: Int): Int {
+        val line = lines[index].trim()
+        if (line.isEmpty()) return 0
+
+        // 含英文字母（3B311）或地点/班级类关键字（7号楼B316、计科教学班）→ 直接排除
+        if (line.any { it in 'A'..'Z' || it in 'a'..'z' }) return 0
+        if (NON_WEEK_KEYWORDS.any { line.contains(it) }) return 0
+
+        // 去除括号与节次描述后必须能解析出周次
+        val cleaned = cleanWeekLine(line)
+        val weeks = extractWeekNumbers(cleaned)
+        if (weeks.isEmpty()) return 0
+        // 周次必须落在一学期的合理范围（1-30 周）
+        if (weeks.any { it !in MIN_WEEK..MAX_WEEK }) return 0
+
+        var score = 0
+        if (line.contains("周")) score += 4                                    // 显式"周"锚点
+        if (line.contains("节")) score += 3                                    // 显式"节"锚点
+        if (SECTION_BRACKET_REGEX.containsMatchIn(line)) score += 2             // 形如 [03-04节]
+        if (line.contains("单") || line.contains("双")) score += 2              // 单/双周
+        if (WEEK_SPEC_REGEX.matches(cleaned)) score += 4                        // 纯周次写法，如 "17"
+        if (index > 0 && lines[index - 1].contains("节")) score += 1            // 紧邻节次行
+        if (index + 1 < lines.size && lines[index + 1].contains("节")) score += 1
+        if (weeks == weeks.sorted()) score += 1                                 // 周次递增，符合写法习惯
+        return score
+    }
+
+    /**
+     * 去掉括号/中括号内容（如 ([周])、([])、(单)、[03-04节]）、"第x-x节"描述和"周"字符
+     */
+    private fun cleanWeekLine(line: String): String = line
+        .replace(Regex("[（(][^）)]*[）)]"), "")
+        .replace(Regex("[\\[【][^\\]】]*[\\]】]"), "")
+        .replace(Regex("第\\s*[\\d一二三四五六七八九十]+\\s*[-~～至]?\\s*[\\d一二三四五六七八九十]*\\s*节"), "")
+        .replace("周", "")
+        .trim()
+
+    /**
+     * 从 "1-2,4,6,8,12,14,16" 这类文本中提取周次
+     * 支持区间（-, ~, ～, 至）与枚举，自动纠正倒序区间
+     */
+    private fun extractWeekNumbers(text: String): List<Int> {
+        if (text.isBlank()) return emptyList()
+        val result = mutableListOf<Int>()
+        WEEK_NUMBER_REGEX.findAll(text).forEach { match ->
+            val rangeStart = match.groupValues[1]
+            if (rangeStart.isNotEmpty()) {
+                val a = rangeStart.toInt()
+                val b = match.groupValues[2].toInt()
+                val from = minOf(a, b)
+                val to = maxOf(a, b)
+                if (to - from <= MAX_WEEK_SPAN) result.addAll(from..to) // 过滤异常大区间
+            } else {
+                result.add(match.groupValues[3].toInt())
+            }
+        }
+        return result.distinct()
+    }
+
+    /**
+     * 从 "1-2,4,6,8,12,14,16([周])[01-02节]" 中提取周数列表
+     * 支持："1-8([周])[03-04节]" → [1..8]，"17([])[01-02节]" → [17]
+     */
+    private fun parseWeeksFromLine(line: String): List<Int> =
+        extractWeekNumbers(cleanWeekLine(line)).sorted()
 
     /**
      * 解析节次名称："第一二节" → (1, 2), "第三四节" → (3, 4)
